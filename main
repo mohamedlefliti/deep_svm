@@ -1,0 +1,599 @@
+"""
+Semi-Supervised Cat Detection on CIFAR-10
+Modified Deep SVDD with Negative Sample Guidance
+
+This script:
+1. Trains the model according to Algorithm 1 in the paper.
+2. Generates all 6 figures automatically.
+3. Saves the trained model and results.
+
+Author: Anonymous
+License: MIT
+"""
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+import torchvision
+import torchvision.transforms as T
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for headless environments
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from sklearn.metrics import roc_curve, auc, precision_recall_curve
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+class Config:
+    # Data
+    data_root = './data'
+    batch_size = 256
+    num_workers = 0  # 0 for CPU-only; increase for GPU
+
+    # Model
+    emb_dim = 32
+
+    # Training
+    epochs = 25
+    lr = 1e-3
+    weight_decay = 1e-5
+    margin = 1.0
+    init_radius = 0.5
+    min_radius = 0.1
+
+    # Threshold
+    percentile = 95
+
+    # Reproducibility
+    seed = 42
+
+    # Device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Output
+    output_dir = './figures'
+    model_path = './model_final.pt'
+
+
+# =============================================================================
+# Reproducibility
+# =============================================================================
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# =============================================================================
+# Encoder (97,824 parameters)
+# =============================================================================
+class Encoder(nn.Module):
+    """
+    Lightweight CNN encoder for CIFAR-10.
+    Architecture:
+        Conv2d(3, 32, 3) -> BN -> ReLU -> MaxPool
+        Conv2d(32, 64, 3) -> BN -> ReLU -> MaxPool
+        Conv2d(64, 128, 3) -> BN -> ReLU -> AdaptiveAvgPool
+        Linear(128, 32)
+    Total parameters: 97,824
+    """
+    def __init__(self, emb_dim=32):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fc = nn.Linear(128, emb_dim)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# =============================================================================
+# Data Loading
+# =============================================================================
+def get_cifar10_loaders(cfg):
+    """
+    Returns:
+        cat_loader: cats for training (4000)
+        neg_loader: non-cats for training (4000)
+        cat_val_loader: cats for validation (500)
+        neg_val_loader: non-cats for validation (1000)
+        test_set: full CIFAR-10 test set (10000)
+    """
+    mean = (0.4914, 0.4822, 0.4465)
+    std = (0.2023, 0.1994, 0.2010)
+
+    train_tf = T.Compose([
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(10),
+        T.ToTensor(),
+        T.Normalize(mean, std),
+    ])
+    test_tf = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean, std),
+    ])
+
+    train_set = torchvision.datasets.CIFAR10(
+        root=cfg.data_root, train=True, download=True, transform=train_tf
+    )
+    test_set = torchvision.datasets.CIFAR10(
+        root=cfg.data_root, train=False, download=True, transform=test_tf
+    )
+
+    targets = np.array(train_set.targets)
+
+    # Cats = class 3
+    cat_idx = np.where(targets == 3)[0]
+    noncat_idx = np.where(targets != 3)[0]
+
+    # Split cats: 4000 train, 500 val
+    np.random.seed(cfg.seed)
+    np.random.shuffle(cat_idx)
+    cat_train_idx = cat_idx[:4000]
+    cat_val_idx = cat_idx[4000:4500]
+
+    # Non-cats: 500 from each of 8 classes (excluding cat=3 and frog=6)
+    neg_train_idx = []
+    neg_val_idx = []
+    for c in range(10):
+        if c == 3 or c == 6:
+            continue
+        cls_idx = noncat_idx[targets[noncat_idx] == c]
+        np.random.shuffle(cls_idx)
+        neg_train_idx.extend(cls_idx[:500])
+        neg_val_idx.extend(cls_idx[500:625])
+
+    neg_train_idx = np.array(neg_train_idx)
+    neg_val_idx = np.array(neg_val_idx)
+
+    cat_train = Subset(train_set, cat_train_idx)
+    cat_val = Subset(train_set, cat_val_idx)
+    neg_train = Subset(train_set, neg_train_idx)
+    neg_val = Subset(train_set, neg_val_idx)
+
+    cat_loader = DataLoader(
+        cat_train, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, drop_last=True
+    )
+    neg_loader = DataLoader(
+        neg_train, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, drop_last=True
+    )
+    cat_val_loader = DataLoader(
+        cat_val, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers
+    )
+    neg_val_loader = DataLoader(
+        neg_val, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers
+    )
+
+    return cat_loader, neg_loader, cat_val_loader, neg_val_loader, test_set
+
+
+# =============================================================================
+# Training (matches Algorithm 1 in the paper)
+# =============================================================================
+def train(cfg):
+    print(f"[INFO] Using device: {cfg.device}")
+    set_seed(cfg.seed)
+
+    (cat_loader, neg_loader, cat_val_loader,
+     neg_val_loader, test_set) = get_cifar10_loaders(cfg)
+
+    model = Encoder(cfg.emb_dim).to(cfg.device)
+    print(f"[INFO] Model parameters: {count_parameters(model):,}")
+
+    optimizer = optim.Adam(
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    # ---- Step 1: Pre-compute centre c (forward pass over cats) ----
+    print("[INFO] Pre-computing centre c...")
+    model.eval()
+    with torch.no_grad():
+        embeddings = []
+        for x, _ in cat_loader:
+            embeddings.append(model(x.to(cfg.device)))
+        c = torch.cat(embeddings, dim=0).mean(dim=0).to(cfg.device)
+    c = c.detach()  # Freeze
+    print(f"[INFO] Centre c computed. Norm = {c.norm().item():.4f}")
+
+    # ---- Step 2: Initialize radius R ----
+    R = torch.tensor(cfg.init_radius, requires_grad=True, device=cfg.device)
+    optimizer.add_param_group({'params': [R]})
+
+    # ---- Step 3: Training loop ----
+    history = {
+        'cat_loss': [], 'neg_loss': [],
+        'cat_dist': [], 'neg_dist': [], 'R': []
+    }
+
+    print(f"[INFO] Starting training for {cfg.epochs} epochs...")
+    for epoch in range(cfg.epochs):
+        model.train()
+        epoch_cat_loss = 0.0
+        epoch_neg_loss = 0.0
+        epoch_cat_dist = 0.0
+        epoch_neg_dist = 0.0
+        n_batches = 0
+
+        for (x_cat, _), (x_neg, _) in zip(cat_loader, neg_loader):
+            x_cat = x_cat.to(cfg.device)
+            x_neg = x_neg.to(cfg.device)
+
+            z_cat = model(x_cat)
+            z_neg = model(x_neg)
+
+            d_cat = torch.norm(z_cat - c, dim=1)
+            d_neg = torch.norm(z_neg - c, dim=1)
+
+            loss_cat = torch.clamp(d_cat ** 2 - R ** 2, min=0).mean()
+            loss_neg = torch.clamp(cfg.margin - (d_neg - R), min=0).mean()
+            loss = R ** 2 + loss_cat + loss_neg
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                R.clamp_(min=cfg.min_radius)
+
+            epoch_cat_loss += loss_cat.item()
+            epoch_neg_loss += loss_neg.item()
+            epoch_cat_dist += d_cat.mean().item()
+            epoch_neg_dist += d_neg.mean().item()
+            n_batches += 1
+
+        history['cat_loss'].append(epoch_cat_loss / n_batches)
+        history['neg_loss'].append(epoch_neg_loss / n_batches)
+        history['cat_dist'].append(epoch_cat_dist / n_batches)
+        history['neg_dist'].append(epoch_neg_dist / n_batches)
+        history['R'].append(R.item())
+
+        print(f"[Epoch {epoch + 1:2d}/{cfg.epochs}] "
+              f"cat_loss={history['cat_loss'][-1]:.4f}  "
+              f"neg_loss={history['neg_loss'][-1]:.4f}  "
+              f"cat_dist={history['cat_dist'][-1]:.4f}  "
+              f"neg_dist={history['neg_dist'][-1]:.4f}  "
+              f"R={history['R'][-1]:.4f}")
+
+    # ---- Step 4: Compute validation threshold tau ----
+    print("[INFO] Computing validation threshold tau...")
+    model.eval()
+    with torch.no_grad():
+        val_dists = []
+        for x, _ in cat_val_loader:
+            z = model(x.to(cfg.device))
+            val_dists.append(torch.norm(z - c, dim=1))
+        val_dists = torch.cat(val_dists).cpu().numpy()
+    tau = float(np.percentile(val_dists, cfg.percentile))
+    print(f"[INFO] Learned R = {R.item():.4f}, tau = {tau:.4f}")
+
+    return model, c, R.item(), tau, history, test_set
+
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+def evaluate(model, c, tau, test_set, cfg):
+    print("[INFO] Evaluating on test set...")
+    model.eval()
+    test_loader = DataLoader(
+        test_set, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers
+    )
+
+    all_dists = []
+    all_labels = []
+    with torch.no_grad():
+        for x, y in test_loader:
+            z = model(x.to(cfg.device))
+            d = torch.norm(z - c, dim=1).cpu().numpy()
+            all_dists.append(d)
+            all_labels.append(y.numpy())
+
+    all_dists = np.concatenate(all_dists)
+    all_labels = np.concatenate(all_labels)
+    accepted = all_dists <= tau
+
+    print("\n[INFO] Per-class results:")
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+    for cls in range(10):
+        mask = all_labels == cls
+        if cls == 3:
+            rate = accepted[mask].mean()
+            print(f"  {class_names[cls]:12s}: acceptance = {rate * 100:.1f}%")
+        else:
+            rate = 1 - accepted[mask].mean()
+            print(f"  {class_names[cls]:12s}: rejection  = {rate * 100:.1f}%")
+
+    # Overall metrics
+    y_true = (all_labels == 3).astype(int)
+    scores = -all_dists  # Lower distance = more likely cat
+    fpr, tpr, _ = roc_curve(y_true, scores)
+    roc_auc = auc(fpr, tpr)
+    precision, recall, _ = precision_recall_curve(y_true, scores)
+    pr_auc = auc(recall, precision)
+
+    # F1 at threshold tau
+    tp = ((all_labels == 3) & accepted).sum()
+    fp = ((all_labels != 3) & accepted).sum()
+    fn = ((all_labels == 3) & ~accepted).sum()
+    tn = ((all_labels != 3) & ~accepted).sum()
+    precision_val = tp / (tp + fp + 1e-9)
+    recall_val = tp / (tp + fn + 1e-9)
+    f1 = 2 * precision_val * recall_val / (precision_val + recall_val + 1e-9)
+    bal_acc = 0.5 * (tp / (tp + fn + 1e-9) + tn / (tn + fp + 1e-9))
+
+    print(f"\n[INFO] Overall metrics:")
+    print(f"  AUROC = {roc_auc:.4f}")
+    print(f"  AUPRC = {pr_auc:.4f}")
+    print(f"  F1    = {f1:.4f}")
+    print(f"  BalAcc = {bal_acc:.4f}")
+
+    return {
+        'all_dists': all_dists,
+        'all_labels': all_labels,
+        'accepted': accepted,
+        'y_true': y_true,
+        'fpr': fpr,
+        'tpr': tpr,
+        'roc_auc': roc_auc,
+        'precision': precision,
+        'recall': recall,
+        'pr_auc': pr_auc,
+    }
+
+
+# =============================================================================
+# Figure Generation
+# =============================================================================
+def generate_figures(history, eval_results, model, c, tau, test_set, cfg):
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    print(f"\n[INFO] Generating figures in {cfg.output_dir}/")
+
+    # ---------- Figure 1: Training loss ----------
+    plt.figure(figsize=(8, 5))
+    epochs = np.arange(1, len(history['cat_loss']) + 1)
+    plt.plot(epochs, history['cat_loss'], 'b-', linewidth=2, label='Cat loss')
+    plt.plot(epochs, history['neg_loss'], 'r-', linewidth=2, label='Negative loss')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training Loss Curves', fontsize=13)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig1_training_loss.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig1_training_loss.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig1_training_loss.pdf")
+
+    # ---------- Figure 2: Training distances ----------
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['cat_dist'], 'b-', linewidth=2,
+             label='Avg cat distance')
+    plt.plot(epochs, history['neg_dist'], 'r-', linewidth=2,
+             label='Avg neg distance')
+    plt.plot(epochs, history['R'], 'k--', linewidth=2,
+             label='Learned radius R')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Distance', fontsize=12)
+    plt.title('Training Distance Curves', fontsize=13)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig2_training_distance.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig2_training_distance.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig2_training_distance.pdf")
+
+    # ---------- Figure 3: t-SNE embeddings ----------
+    print("  [INFO] Computing t-SNE (may take 1-2 minutes)...")
+    model.eval()
+    test_loader = DataLoader(
+        test_set, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers
+    )
+    embeddings = []
+    labels = []
+    with torch.no_grad():
+        for x, y in test_loader:
+            z = model(x.to(cfg.device))
+            embeddings.append(z.cpu().numpy())
+            labels.append(y.numpy())
+    embeddings = np.concatenate(embeddings)
+    labels = np.concatenate(labels)
+
+    # Subsample for t-SNE speed
+    rng = np.random.RandomState(cfg.seed)
+    n_sub = min(2000, len(embeddings))
+    idx = rng.choice(len(embeddings), n_sub, replace=False)
+    emb_sub = embeddings[idx]
+    lab_sub = labels[idx]
+
+    tsne = TSNE(n_components=2, random_state=cfg.seed,
+                perplexity=30, n_iter=1000, init='pca')
+    emb_2d = tsne.fit_transform(emb_sub)
+
+    plt.figure(figsize=(9, 7))
+    colors = {3: 'blue', 5: 'red', 2: 'green'}
+    names = {3: 'Cat', 5: 'Dog', 2: 'Bird'}
+    for cls, color in colors.items():
+        mask = lab_sub == cls
+        if mask.sum() > 0:
+            plt.scatter(emb_2d[mask, 0], emb_2d[mask, 1],
+                        c=color, label=names[cls], alpha=0.6, s=15,
+                        edgecolors='none')
+    other_mask = ~np.isin(lab_sub, list(colors.keys()))
+    if other_mask.sum() > 0:
+        plt.scatter(emb_2d[other_mask, 0], emb_2d[other_mask, 1],
+                    c='grey', label='Other', alpha=0.3, s=10,
+                    edgecolors='none')
+    plt.legend(fontsize=11, loc='best')
+    plt.title('t-SNE of Learned Embeddings', fontsize=13)
+    plt.xlabel('t-SNE dim 1', fontsize=12)
+    plt.ylabel('t-SNE dim 2', fontsize=12)
+    plt.grid(True, alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig3_embeddings_tsne.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig3_embeddings_tsne.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig3_embeddings_tsne.pdf")
+
+    # ---------- Figure 4: Distance histogram ----------
+    all_dists = eval_results['all_dists']
+    all_labels = eval_results['all_labels']
+
+    plt.figure(figsize=(10, 6))
+    bins = np.linspace(0, 4, 60)
+    for cls, color, name in [(3, 'blue', 'Cats'),
+                              (5, 'red', 'Dogs'),
+                              (2, 'green', 'Birds')]:
+        mask = all_labels == cls
+        plt.hist(all_dists[mask], bins=bins, alpha=0.5,
+                 color=color, label=name, density=True)
+    # Other classes
+    other_mask = ~np.isin(all_labels, [2, 3, 5])
+    plt.hist(all_dists[other_mask], bins=bins, alpha=0.3,
+             color='grey', label='Other classes', density=True)
+    plt.axvline(history['R'][-1], color='black', linestyle='--',
+                linewidth=2, label=f'R = {history["R"][-1]:.3f}')
+    plt.axvline(tau, color='darkred', linestyle='--',
+                linewidth=2, label=f'tau = {tau:.3f}')
+    plt.xlabel('Distance to centre', fontsize=12)
+    plt.ylabel('Density', fontsize=12)
+    plt.title('Distance Distributions on Test Set', fontsize=13)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig4_distance_hist.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig4_distance_hist.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig4_distance_hist.pdf")
+
+    # ---------- Figure 5a: ROC curve ----------
+    plt.figure(figsize=(6.5, 5.5))
+    plt.plot(eval_results['fpr'], eval_results['tpr'], 'b-',
+             linewidth=2,
+             label=f"Our method (AUROC = {eval_results['roc_auc']:.3f})")
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Chance')
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title('ROC Curve', fontsize=13)
+    plt.legend(fontsize=11, loc='lower right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig5_roc.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig5_roc.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig5_roc.pdf")
+
+    # ---------- Figure 5b: PR curve ----------
+    plt.figure(figsize=(6.5, 5.5))
+    plt.plot(eval_results['recall'], eval_results['precision'], 'b-',
+             linewidth=2,
+             label=f"Our method (AUPRC = {eval_results['pr_auc']:.3f})")
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title('Precision-Recall Curve', fontsize=13)
+    plt.legend(fontsize=11, loc='lower left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig5_pr.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig5_pr.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig5_pr.pdf")
+
+    # ---------- Figure 6: Margin sensitivity ----------
+    # NOTE: These values are from the paper's Table 6.
+    # To regenerate empirically, retrain with each margin value.
+    margins = [0.3, 0.5, 0.8, 1.0, 1.2, 1.5, 1.7]
+    aurocs = [0.680, 0.710, 0.720, 0.725, 0.720, 0.700, 0.670]
+    plt.figure(figsize=(7.5, 5))
+    plt.plot(margins, aurocs, 'o-', color='blue',
+             linewidth=2, markersize=8)
+    plt.xlabel('Margin m', fontsize=12)
+    plt.ylabel('AUROC', fontsize=12)
+    plt.title('Sensitivity of AUROC to Margin Parameter', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.output_dir, 'fig6_margin_sensitivity.pdf'),
+                dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(cfg.output_dir, 'fig6_margin_sensitivity.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  [OK] fig6_margin_sensitivity.pdf")
+
+    print(f"\n[INFO] All figures saved to {cfg.output_dir}/")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    cfg = Config()
+    set_seed(cfg.seed)
+
+    # Train
+    model, c, R, tau, history, test_set = train(cfg)
+
+    # Evaluate
+    eval_results = evaluate(model, c, tau, test_set, cfg)
+
+    # Generate figures
+    generate_figures(history, eval_results, model, c, tau, test_set, cfg)
+
+    # Save model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'centre': c.cpu(),
+        'radius': R,
+        'threshold': tau,
+        'config': {k: v for k, v in vars(cfg).items() if not k.startswith('_')},
+    }, cfg.model_path)
+    print(f"\n[INFO] Model saved to {cfg.model_path}")
+    print("[INFO] Done.")
+
+
+if __name__ == '__main__':
+    main()
